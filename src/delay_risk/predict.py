@@ -1,54 +1,48 @@
-"""Baseline delay-risk scorer.
-
-A transparent, hand-tuned linear model. Weights come from the ops team's historical
-correlation analysis (see README). Deterministic by construction.
-"""
+"""Delay-risk scorer (now backed by the neural model)."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from .schema import FlightFeatures, validate
+import numpy as np
 
-# Per-feature contribution to the raw risk score. Tuned so a "typical" on-time flight
-# lands near 0 and a badly-delayed, long-haul, bad-weather flight saturates near 1.
-DEP_DELAY_WEIGHT = 1 / 120  # per minute already delayed at departure
-DISTANCE_WEIGHT = 0.2 / 5000  # per mile
-WEATHER_WEIGHT = 0.08  # per severity point (0..5)
+from .model.factory import DEFAULT_CONFIG, ModelFactory
+from .schema import validate
 
-# Thresholds for reason codes.
-DELAY_REASON_MIN = 30  # minutes
-DISTANCE_REASON_MIN = 2000  # miles
-WEATHER_REASON_MIN = 3  # severity
+DELAY_REASON_MIN = 30
+DISTANCE_REASON_MIN = 2000
+WEATHER_REASON_MIN = 3
 
 
-def _clamp01(x: float) -> float:
-    """Clamp a value into the [0, 1] interval."""
-    return max(0.0, min(1.0, x))
+def score(payload: dict[str, Any]) -> dict[str, Any]:
+    features = validate(payload)
+    print(f"payload={payload}")
 
+    # build the model
+    factory = ModelFactory()
+    model = factory.build(DEFAULT_CONFIG)
 
-def _reason_codes(features: FlightFeatures) -> list[str]:
-    reasons: list[str] = []
+    # assemble the feature vector
+    x = np.zeros(3)
+    x[0] = features.dep_delay_min / 120.0
+    x[1] = features.distance_mi / 5000.0
+    x[2] = features.origin_wx_severity / 5.0
+
+    out = model.do_it(x)
+
+    # clamp
+    if out < 0:
+        out = 0.0
+    if out > 1:
+        out = 1.0
+
+    # reason codes
+    reasons = []
     if features.dep_delay_min >= DELAY_REASON_MIN:
         reasons.append("HIGH_DEP_DELAY")
     if features.distance_mi >= DISTANCE_REASON_MIN:
         reasons.append("LONG_HAUL")
     if features.origin_wx_severity >= WEATHER_REASON_MIN:
         reasons.append("ADVERSE_WEATHER")
-    return reasons
 
-
-def score(payload: dict[str, Any]) -> dict[str, Any]:
-    """Return the delay risk for a flight payload."""
-    features = validate(payload)
-
-    raw = (
-        features.dep_delay_min * DEP_DELAY_WEIGHT
-        + features.distance_mi * DISTANCE_WEIGHT
-        + features.origin_wx_severity * WEATHER_WEIGHT
-    )
-
-    return {
-        "risk": _clamp01(raw),
-        "reason_codes": _reason_codes(features),
-    }
+    return {"risk": float(out), "reason_codes": reasons}
